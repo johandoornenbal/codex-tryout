@@ -1,0 +1,23 @@
+name: Build Apple Silicon VST3
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Configure Apple Silicon
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+      - name: Build
+        run: cmake --build build --config Release --parallel 3
+      - name: Test DSP
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Ad-hoc sign and archive
+        run: |
+          codesign --force --deep --sign - "build/ButterCompStudio_artefacts/Release/VST3/ButterComp Studio.vst3"
+          ditto -c -k --sequesterRsrc --keepParent "build/ButterCompStudio_artefacts/Release/VST3/ButterComp Studio.vst3" ButterComp-Studio-macOS-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ButterComp-Studio-macOS-arm64
+          path: ButterComp-Studio-macOS-arm64.zip
