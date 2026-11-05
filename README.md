@@ -131,3 +131,11 @@ The loudness test suite compares measurements to independent libebur128 results
 at 44.1/48/96/192 kHz. Wrapper checks cover a known -6.02 dB match, visible readout,
 session recall, exact dry A/B, reset isolation and an unchanged engine signal when
 matching is not learned.
+
+## Interface size
+
+Choose **Small (75%)**, **Medium (100%)**, or **Large (125%)** from the menu at
+the top right. The entire interface scales proportionally, including the meters
+and controls. Medium retains the original size. The selection is saved per plugin
+instance with the session and retained when reopening the editor. Older sessions
+open at Medium. Audio processing and level matching are unchanged.

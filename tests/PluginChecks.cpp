@@ -51,8 +51,8 @@ int main() {
     p->getParameters()[1]->setValueNotifyingHost(1.f);
     p->getParameters()[2]->setValueNotifyingHost(1.f);
     p->prepareToPlay(48000,512);
-    auto* learn=dynamic_cast<juce::Button*>(editor->findChildWithID("learnMatch"));
-    auto* reset=dynamic_cast<juce::Button*>(editor->findChildWithID("resetMatch"));
+    auto* learn=dynamic_cast<juce::Button*>(editor->getChildComponent(0)->findChildWithID("learnMatch"));
+    auto* reset=dynamic_cast<juce::Button*>(editor->getChildComponent(0)->findChildWithID("resetMatch"));
     if(!learn || !reset) return 10;
     learn->onClick();
     auto feed=[&](int blocks) {
@@ -95,7 +95,7 @@ int main() {
     if(!copy || std::abs(copy->getDoubleAttribute("matchDb")+6.0206)>.03) return 23;
     // Recreate the editor to verify the persisted adjustment is visible immediately.
     editor.reset(p->createEditor());
-    auto* display=dynamic_cast<juce::Label*>(editor->findChildWithID("matchReadout"));
+    auto* display=dynamic_cast<juce::Label*>(editor->getChildComponent(0)->findChildWithID("matchReadout"));
     if(!display || !display->getText().contains("-6.0 dB")) return 13;
     // Screenshot the real learned state before clearing it.
     juce::Image image(juce::Image::ARGB,editor->getWidth(),editor->getHeight(),true);
@@ -110,16 +110,16 @@ int main() {
     if(saved.getWidth()!=editor->getWidth() || saved.getHeight()!=editor->getHeight()) return 9;
     if(editor->getWidth()!=840 || editor->getHeight()!=810) return 5;
     int meters=0;
-    for(auto* child:editor->getChildren()) {
+    for(auto* child:editor->getChildComponent(0)->getChildren()) {
         if(child->getTitle().startsWith("Gain reduction ")) {
             ++meters;
             if(!editor->getLocalBounds().contains(child->getBounds())) return 6;
         }
     }
     if(meters!=2) return 7;
-    reset=dynamic_cast<juce::Button*>(editor->findChildWithID("resetMatch"));
+    reset=dynamic_cast<juce::Button*>(editor->getChildComponent(0)->findChildWithID("resetMatch"));
     reset->onClick();
-    auto* clearDisplay=dynamic_cast<juce::Label*>(editor->findChildWithID("matchReadout"));
+    auto* clearDisplay=dynamic_cast<juce::Label*>(editor->getChildComponent(0)->findChildWithID("matchReadout"));
     if(!clearDisplay || !clearDisplay->getText().contains("--")) return 19;
     feed(4);
     juce::MemoryBlock cleared; p->getStateInformation(cleared);
@@ -144,6 +144,44 @@ int main() {
     restored->getStateInformation(savedAgain);
     copy=juce::AudioProcessor::getXmlFromBinary(savedAgain.getData(),static_cast<int>(savedAgain.getSize()));
     if(copy->getBoolAttribute("hasMatch") || restored->getParameters()[4]->getValue()>.5f) return 17;
+    // Exercise each size, render it, and recall the selection in a fresh processor.
+    auto* sizeChoice=dynamic_cast<juce::ComboBox*>(editor->getChildComponent(0)->findChildWithID("uiSize"));
+    if(!sizeChoice || sizeChoice->getNumItems()!=3 || sizeChoice->getSelectedId()!=2) return 26;
+    for(int id : {1,3,2}) {
+        sizeChoice->setSelectedId(id,juce::sendNotificationSync);
+        const float scale=id==1?.75f:id==3?1.25f:1.f;
+        const int width=juce::roundToInt(840*scale),height=juce::roundToInt(810*scale);
+        if(editor->getWidth()!=width || editor->getHeight()!=height) return 27;
+        auto* panel=editor->getChildComponent(0);
+        for(auto* child:panel->getChildren()) {
+            const auto bounds=editor->getLocalArea(panel,child->getBounds());
+            if(!editor->getLocalBounds().contains(bounds)) return 28;
+            const auto centre=editor->getLocalPoint(child,child->getLocalBounds().getCentre());
+            if(editor->getComponentAt(centre)==editor.get()) return 29;
+        }
+        juce::Image scaled(juce::Image::ARGB,width,height,true);
+        juce::Graphics graphics(scaled); editor->paintEntireComponent(graphics,true);
+        auto file=juce::File::getCurrentWorkingDirectory().getChildFile("ui-size-"+juce::String(id)+".png");
+        if(auto stream=file.createOutputStream()) {
+            stream->setPosition(0); stream->truncate();
+            if(!juce::PNGImageFormat().writeImageToStream(scaled,*stream)) return 30;
+        } else return 31;
+        juce::MemoryBlock sized; p->getStateInformation(sized);
+        restored->setStateInformation(sized.getData(),static_cast<int>(sized.getSize()));
+        std::unique_ptr<juce::AudioProcessorEditor> recalled(restored->createEditor());
+        if(recalled->getWidth()!=width || recalled->getHeight()!=height) return 32;
+        auto* recalledChoice=dynamic_cast<juce::ComboBox*>(recalled->getChildComponent(0)->findChildWithID("uiSize"));
+        if(!recalledChoice || recalledChoice->getSelectedId()!=id) return 33;
+        editor.reset(); editor.reset(p->createEditor());
+        sizeChoice=dynamic_cast<juce::ComboBox*>(editor->getChildComponent(0)->findChildWithID("uiSize"));
+        if(!sizeChoice || sizeChoice->getSelectedId()!=id || editor->getWidth()!=width || editor->getHeight()!=height) return 35;
+    }
+    // Older sessions have no size property and open at the original dimensions.
+    copy->removeAttribute("uiSize");
+    juce::MemoryBlock oldSize; juce::AudioProcessor::copyXmlToBinary(*copy,oldSize);
+    restored->setStateInformation(oldSize.getData(),static_cast<int>(oldSize.getSize()));
+    std::unique_ptr<juce::AudioProcessorEditor> legacyEditor(restored->createEditor());
+    if(legacyEditor->getWidth()!=840 || legacyEditor->getHeight()!=810) return 34;
     editor.reset(); p->releaseResources();
     std::cout<<"Parameter state round-trip, stereo processing, and editor render passed\n";
 }

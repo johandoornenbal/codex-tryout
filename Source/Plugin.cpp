@@ -117,6 +117,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     void getStateInformation(juce::MemoryBlock& dst) override {
         auto saved=state.copyState();
+        saved.setProperty("uiSize",uiSize.load(),nullptr);
         saved.setProperty("matchDb",matchDb.load(),nullptr);
         saved.setProperty("hasMatch",hasMatch.load(),nullptr);
         saved.setProperty("learnedInput",learnedInput.load(),nullptr);
@@ -126,6 +127,7 @@ public:
     void setStateInformation(const void* data,int size) override {
         if(auto xml=getXmlFromBinary(data,size); xml && xml->hasTagName(state.state.getType())) {
             auto restored=juce::ValueTree::fromXml(*xml);
+            uiSize=juce::jlimit(1,3,static_cast<int>(restored.getProperty("uiSize",2)));
             const auto db=static_cast<float>(restored.getProperty("matchDb",0.f));
             matchDb=std::isfinite(db)?juce::jlimit(-24.f,24.f,db):0.f;
             hasMatch=std::isfinite(db)&&static_cast<bool>(restored.getProperty("hasMatch",false));
@@ -150,6 +152,7 @@ public:
     std::atomic<bool> hasMatch{false},learning{false};
     std::atomic<int> command{0},learnResult{0};
     std::atomic<uint32_t> matchRevision{0};
+    std::atomic<int> uiSize{2};
 private:
     void timerCallback() override {
         // Mark custom learned state dirty on the message thread, even if the
@@ -266,9 +269,9 @@ private:
     float value=0;
 };
 
-class ButterEditor final : public juce::AudioProcessorEditor, private juce::Timer {
+class ButterPanel final : public juce::Component, private juce::Timer {
 public:
-    explicit ButterEditor(ButterProcessor& proc) : AudioProcessorEditor(proc), processor(proc) {
+    explicit ButterPanel(ButterProcessor& proc) : processor(proc) {
         setLookAndFeel(&look);
         const char* ids[]={"compress","output","mix"};
         const char* labels[]={"COMPRESS","OUTPUT","MIX"};
@@ -318,11 +321,26 @@ public:
         enableButton.setTooltip("Enable or disable the learned gain without losing it.");
         abButton.setTooltip("Compare the original input with the processed output. Short fades prevent switching clicks.");
         refreshMatch();
+        addAndMakeVisible(sizeChoice);
+        sizeChoice.setComponentID("uiSize");
+        sizeChoice.setName("Interface size");
+        sizeChoice.setTooltip("Interface size: Small 75%, Medium 100%, or Large 125%.");
+        sizeChoice.addItem("Small (75%)",1);
+        sizeChoice.addItem("Medium (100%)",2);
+        sizeChoice.addItem("Large (125%)",3);
+        sizeChoice.setSelectedId(processor.uiSize.load(),juce::dontSendNotification);
+        sizeChoice.onChange=[this] {
+            processor.uiSize=sizeChoice.getSelectedId();
+            processor.updateHostDisplay(juce::AudioProcessor::ChangeDetails{}.withNonParameterStateChanged(true));
+            if(sizeChanged) sizeChanged();
+        };
         setSize(840,810);
         startTimerHz(30);
     }
-    ~ButterEditor() override { stopTimer(); setLookAndFeel(nullptr); }
+    ~ButterPanel() override { stopTimer(); setLookAndFeel(nullptr); }
+    std::function<void()> sizeChanged;
     void resized() override {
+        sizeChoice.setBounds(630,16,174,26);
         leftMeter.setBounds(43,141,361,208);
         rightMeter.setBounds(436,141,361,208);
         knobs[0].setBounds(80,402,230,207);
@@ -385,6 +403,10 @@ private:
         matchStatus.setText(text,juce::dontSendNotification);
     }
     void timerCallback() override {
+        if(sizeChoice.getSelectedId()!=processor.uiSize.load()) {
+            sizeChoice.setSelectedId(processor.uiSize.load(),juce::dontSendNotification);
+            if(sizeChanged) sizeChanged();
+        }
         refreshMatch();
         const auto sequence=processor.meterSequence.load(std::memory_order_relaxed);
         idleTicks=sequence==lastSequence?juce::jmin(idleTicks+1,16):0;
@@ -397,6 +419,7 @@ private:
         shownR=r>shownR?r:r+decay*(shownR-r);
         leftMeter.setReduction(shownL); rightMeter.setReduction(shownR);
     }
+    juce::ComboBox sizeChoice;
     juce::TextButton learnButton{"Learn Match"},resetButton{"Reset Match"},enableButton{"Match ON"},abButton{"B: Processed"};
     juce::Label readout,matchStatus;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enableAttachment,abAttachment;
@@ -409,6 +432,26 @@ private:
     std::array<juce::Slider,3> knobs;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>,3> attachments;
     juce::TooltipWindow tooltip{this,600};
+};
+// Scale a fixed logical panel so painting, controls, and hit testing share one transform.
+// The editor itself retains JUCE's independent host/HiDPI scale handling.
+class ButterEditor final : public juce::AudioProcessorEditor {
+public:
+    explicit ButterEditor(ButterProcessor& p) : AudioProcessorEditor(p), processor(p), panel(p) {
+        addAndMakeVisible(panel);
+        setResizable(false,false);
+        panel.sizeChanged=[this] { applySize(); };
+        applySize();
+    }
+private:
+    void applySize() {
+        const float scale=processor.uiSize.load()==1?.75f:processor.uiSize.load()==3?1.25f:1.f;
+        panel.setTransform(juce::AffineTransform::scale(scale));
+        panel.setBounds(0,0,840,810);
+        setSize(juce::roundToInt(840*scale),juce::roundToInt(810*scale));
+    }
+    ButterProcessor& processor;
+    ButterPanel panel;
 };
 juce::AudioProcessorEditor* ButterProcessor::createEditor() { return new ButterEditor(*this); }
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new ButterProcessor; }
