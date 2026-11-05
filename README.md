@@ -5,7 +5,7 @@ charcoal and brass editor. For Apple Silicon Macs, including M2 and later.
 
 ![Rendered plugin editor](docs/ui-preview.png)
 
-Three automatable controls retain ButterComp2's original ranges and defaults:
+Three main controls retain ButterComp2's original ranges and defaults:
 
 | Control | Range | Default |
 | --- | --- | --- |
@@ -90,10 +90,44 @@ with the selected JUCE license when distributing binaries. See THIRD_PARTY.md.
 
 ## Current verification
 
-In this Linux cloud instance: VST3 compilation and all four CTest suites passed.
+In this Linux cloud instance: VST3 compilation and all five CTest suites passed.
 The suites cover 29 DSP scenarios, 48 upstream-reference comparisons (maximum
 absolute error 3.55271e-15), gain-reduction calibration and ballistics at four sample rates, and wrapper
 state/audio/editor checks. The image above
 is rendered from the actual native editor, not a design mockup. The reusable cloud
 setup script was also executed successfully. No Apple Silicon binary or DAW test
 has been produced in this Linux environment.
+
+## LUFS level matching
+
+Click **Learn Match** while a representative section plays. The plugin collects
+15 seconds of audible, input-gated measurement windows (roughly 15.3 seconds of
+continuous audio). Silence pauses the clock. You may choose **Finish Learning**
+after at least three seconds. The large **MATCH -3.0 dB** readout shows the exact
+signed compensation to 0.1 dB, with input and pre-compensation processed LUFS
+beneath it. Positive values boost; negative values attenuate.
+
+The learned gain is fixed, stored with the session, and applied after the original
+ButterComp2 engine, Output and Mix. The Airwindows algorithm is unchanged. Relearn
+if the source or compressor settings change. Learning uses stereo BS.1770
+K-weighting with 400 ms / 100 ms overlapping windows and absolute/relative gates.
+This is a short representative-passage estimate, not whole-programme mastering
+normalisation or a true-peak limiter. Compensation is capped at +/-24 dB; the UI
+reports a capped result. No measurable output or too little audio leaves the last
+successful match untouched and displays an explanation. Positive gain can require
+extra output headroom.
+
+- **Match ON/OFF** disables compensation while preserving its learned value.
+- **A: Original / B: Processed** compares the untouched input with the processed
+  path (including matching when enabled). A short crossfade prevents switching
+  clicks. The engine continues running in A so switching back is consistent.
+- **Reset Match** immediately clears only the learned adjustment and cancels
+  learning. Compress, Output, Mix, Match ON/OFF and A/B remain as set.
+
+Use the internal A/B for comparisons; DAW bypass behavior depends on the host.
+Learning is suspended while the host bypasses processing. New controls are appended
+to the original parameter list, and old sessions default to no learned adjustment.
+The loudness test suite compares measurements to independent libebur128 results
+at 44.1/48/96/192 kHz. Wrapper checks cover a known -6.02 dB match, visible readout,
+session recall, exact dry A/B, reset isolation and an unchanged engine signal when
+matching is not learned.

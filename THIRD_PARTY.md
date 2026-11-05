@@ -20,3 +20,12 @@ does not relicense JUCE. For distribution, comply with JUCE's AGPLv3 terms
 (including corresponding source) or obtain a suitable JUCE commercial license.
 See https://github.com/juce-framework/JUCE/blob/8.0.12/LICENSE.md.
 The VST3 SDK bundled with JUCE has its own license notices, which must be retained.
+
+Level matching is an independent post-engine stage. Its stereo BS.1770
+K-weighting filter design follows libebur128 by Jan Kokemueller (MIT), pinned at
+`67b33abe1558160ed76ada1322329b0e9e058b02` from
+https://github.com/jiixyj/libebur128. The upstream C implementation and license
+are retained in `third_party/libebur128` as an independent test oracle; they are
+not linked into the plugin. Queue compatibility code retains its embedded BSD
+license notices. `Source/LoudnessMatch.h` uses bounded 400 ms windows, 100 ms hops,
+a -70 LUFS absolute gate and -10 LU relative gate for learning.

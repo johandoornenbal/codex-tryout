@@ -1,21 +1,54 @@
 #include <JuceHeader.h>
 #include "ButterEngine.h"
+#include "LoudnessMatch.h"
 #include <atomic>
 
-class ButterProcessor final : public juce::AudioProcessor {
+class ButterProcessor final : public juce::AudioProcessor, private juce::Timer {
 public:
     ButterProcessor() : AudioProcessor(BusesProperties()
         .withInput("Input", juce::AudioChannelSet::stereo(), true)
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-        state(*this, nullptr, "ButterState", layout()) {}
+        state(*this, nullptr, "ButterState", layout()) { startTimerHz(10); }
+    ~ButterProcessor() override { stopTimer(); }
     static juce::AudioProcessorValueTreeState::ParameterLayout layout() {
         juce::AudioProcessorValueTreeState::ParameterLayout p;
         p.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"compress",1}, "Compress", 0.f, 1.f, 0.f));
         p.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"output",1}, "Output", 0.f, 2.f, 1.f));
         p.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"mix",1}, "Mix", 0.f, 1.f, 1.f));
+        p.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"matchEnabled",1}, "Level Match", true));
+        p.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"original",1}, "Original A/B", false));
         return p;
     }
-    void prepareToPlay(double rate, int) override { engine.reset(rate); reductionL=0; reductionR=0; }
+    void prepareToPlay(double rate, int) override {
+        engine.reset(rate); reductionL=0; reductionR=0; loudness.prepare(rate);
+        learning=false; progress=0; command=0;
+        gainSmooth.reset(rate,.02); blendSmooth.reset(rate,.005);
+        gainSmooth.setCurrentAndTargetValue(targetGain());
+        blendSmooth.setCurrentAndTargetValue(state.getRawParameterValue("original")->load()>.5f?0.:1.);
+    }
+    double targetGain() const {
+        return hasMatch.load() && state.getRawParameterValue("matchEnabled")->load()>.5f
+            ? std::pow(10.,static_cast<double>(matchDb.load())/20.) : 1.;
+    }
+    void finishLearn() {
+        const auto result=loudness.finish();
+        if(result==LoudnessMatch::Result::success || result==LoudnessMatch::Result::limited) {
+            matchDb=static_cast<float>(loudness.trimDb); hasMatch=true;
+            learnedInput=static_cast<float>(loudness.inputLufs); learnedOutput=static_cast<float>(loudness.outputLufs);
+            matchRevision.fetch_add(1);
+        }
+        learnResult=static_cast<int>(result); learning=false;
+    }
+    void handleCommand() {
+        const auto request=command.exchange(0);
+        if(request==1) { loudness.start(); learning=true; progress=0; learnResult=0; }
+        if(request==2 && learning.load()) finishLearn();
+        if(request==4) { loudness.cancel(); learning=false; progress=0; learnResult=0; }
+        if(request==3) {
+            loudness.cancel(); learning=false; progress=0; hasMatch=false; matchDb=0; learnResult=0;
+            learnedInput=0; learnedOutput=0;
+        }
+    }
     void releaseResources() override {}
     bool isBusesLayoutSupported(const BusesLayout& b) const override {
         return b.getMainInputChannelSet() == juce::AudioChannelSet::stereo()
@@ -26,9 +59,35 @@ public:
         engine.parameters(state.getRawParameterValue("compress")->load(),
                           state.getRawParameterValue("output")->load() * .5f,
                           state.getRawParameterValue("mix")->load());
-        T* data[]={b.getWritePointer(0), b.getWritePointer(1)};
-        if constexpr (std::is_same_v<T,float>) engine.processReplacing(data,data,b.getNumSamples());
-        else engine.processDoubleReplacing(data,data,b.getNumSamples());
+        handleCommand();
+        // Small stack buffers keep the original input available without audio-thread allocations.
+        // Both measurements precede the compensation stage; no gain feeds back into ButterComp2.
+        std::array<T,256> dryL{},dryR{};
+        for(int offset=0;offset<b.getNumSamples();offset+=256) {
+            const int count=juce::jmin(256,b.getNumSamples()-offset);
+            auto* left=b.getWritePointer(0)+offset; auto* right=b.getWritePointer(1)+offset;
+            std::copy_n(left,count,dryL.data()); std::copy_n(right,count,dryR.data());
+            T* data[]={left,right};
+            if constexpr (std::is_same_v<T,float>) engine.processReplacing(data,data,count);
+            else engine.processDoubleReplacing(data,data,count);
+            gainSmooth.setTargetValue(targetGain());
+            blendSmooth.setTargetValue(state.getRawParameterValue("original")->load()>.5f?0.:1.);
+            for(int i=0;i<count;++i) {
+                if(loudness.learning()) {
+                    loudness.sample(dryL[static_cast<size_t>(i)],dryR[static_cast<size_t>(i)],left[i],right[i]);
+                    if(loudness.complete()) { finishLearn(); gainSmooth.setTargetValue(targetGain()); }
+                }
+                const auto gain=gainSmooth.getNextValue(),blend=blendSmooth.getNextValue();
+                // Preserve the original sample exactly at either unity endpoint.
+                if(blend<=0) { left[i]=dryL[static_cast<size_t>(i)]; right[i]=dryR[static_cast<size_t>(i)]; }
+                else if(blend>=1) { if(gain<1 || gain>1) { left[i]=static_cast<T>(left[i]*gain); right[i]=static_cast<T>(right[i]*gain); } }
+                else {
+                    left[i]=static_cast<T>(dryL[static_cast<size_t>(i)]*(1-blend)+left[i]*gain*blend);
+                    right[i]=static_cast<T>(dryR[static_cast<size_t>(i)]*(1-blend)+right[i]*gain*blend);
+                }
+            }
+        }
+        progress=loudness.seconds();
         publishMeters();
     }
     void processBlock(juce::AudioBuffer<float>& b, juce::MidiBuffer&) override { process(b); }
@@ -39,10 +98,10 @@ public:
         meterSequence.fetch_add(1, std::memory_order_relaxed);
     }
     void processBlockBypassed(juce::AudioBuffer<float>& b, juce::MidiBuffer&) override {
-        engine.releaseMeters(b.getNumSamples()); publishMeters();
+        handleCommand(); engine.releaseMeters(b.getNumSamples()); publishMeters();
     }
     void processBlockBypassed(juce::AudioBuffer<double>& b, juce::MidiBuffer&) override {
-        engine.releaseMeters(b.getNumSamples()); publishMeters();
+        handleCommand(); engine.releaseMeters(b.getNumSamples()); publishMeters();
     }
     bool supportsDoublePrecisionProcessing() const override { return true; }
     const juce::String getName() const override { return "ButterComp Studio"; }
@@ -57,17 +116,54 @@ public:
     bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override;
     void getStateInformation(juce::MemoryBlock& dst) override {
-        if(auto xml=state.copyState().createXml()) copyXmlToBinary(*xml,dst);
+        auto saved=state.copyState();
+        saved.setProperty("matchDb",matchDb.load(),nullptr);
+        saved.setProperty("hasMatch",hasMatch.load(),nullptr);
+        saved.setProperty("learnedInput",learnedInput.load(),nullptr);
+        saved.setProperty("learnedOutput",learnedOutput.load(),nullptr);
+        if(auto xml=saved.createXml()) copyXmlToBinary(*xml,dst);
     }
     void setStateInformation(const void* data,int size) override {
-        if(auto xml=getXmlFromBinary(data,size); xml && xml->hasTagName(state.state.getType()))
-            state.replaceState(juce::ValueTree::fromXml(*xml));
+        if(auto xml=getXmlFromBinary(data,size); xml && xml->hasTagName(state.state.getType())) {
+            auto restored=juce::ValueTree::fromXml(*xml);
+            const auto db=static_cast<float>(restored.getProperty("matchDb",0.f));
+            matchDb=std::isfinite(db)?juce::jlimit(-24.f,24.f,db):0.f;
+            hasMatch=std::isfinite(db)&&static_cast<bool>(restored.getProperty("hasMatch",false));
+            learnedInput=static_cast<float>(restored.getProperty("learnedInput",0.f));
+            learnedOutput=static_cast<float>(restored.getProperty("learnedOutput",0.f));
+            command=4; // Cancel in-flight learning on the audio thread after state restoration.
+            // Legacy sessions predate both appended controls; restore their defaults.
+            for(const auto& entry : std::array<std::pair<const char*,float>,2>{{{"matchEnabled",1.f},{"original",0.f}}}) {
+                if(!restored.getChildWithProperty("id",entry.first).isValid()) {
+                    juce::ValueTree parameter{"PARAM"};
+                    parameter.setProperty("id",entry.first,nullptr); parameter.setProperty("value",entry.second,nullptr);
+                    restored.appendChild(parameter,nullptr);
+                }
+            }
+            state.replaceState(restored);
+        }
     }
     juce::AudioProcessorValueTreeState state;
     std::atomic<float> reductionL{0}, reductionR{0};
     std::atomic<uint32_t> meterSequence{0};
+    std::atomic<float> matchDb{0},progress{0},learnedInput{0},learnedOutput{0};
+    std::atomic<bool> hasMatch{false},learning{false};
+    std::atomic<int> command{0},learnResult{0};
+    std::atomic<uint32_t> matchRevision{0};
 private:
+    void timerCallback() override {
+        // Mark custom learned state dirty on the message thread, even if the
+        // editor closed during learning. Never call host listeners from process().
+        const auto revision=matchRevision.load();
+        if(revision!=notifiedRevision) {
+            notifiedRevision=revision;
+            updateHostDisplay(ChangeDetails{}.withNonParameterStateChanged(true));
+        }
+    }
+    uint32_t notifiedRevision=0;
     ButterEngine engine;
+    LoudnessMatch loudness;
+    juce::SmoothedValue<double> gainSmooth{1.},blendSmooth{1.};
 };
 
 namespace style {
@@ -197,7 +293,32 @@ public:
         shownR=processor.reductionR.load(std::memory_order_relaxed);
         lastSequence=processor.meterSequence.load(std::memory_order_relaxed);
         leftMeter.setReduction(shownL); rightMeter.setReduction(shownR);
-        setSize(840,660);
+        for(auto* button : {&learnButton,&resetButton,&enableButton,&abButton}) {
+            addAndMakeVisible(*button);
+            button->setColour(juce::TextButton::buttonColourId,style::ink.brighter(.15f));
+            button->setColour(juce::TextButton::textColourOffId,style::cream);
+        }
+        learnButton.setComponentID("learnMatch"); resetButton.setComponentID("resetMatch");
+        enableButton.setComponentID("matchEnabled"); abButton.setComponentID("abOriginal");
+        readout.setComponentID("matchReadout");
+        learnButton.onClick=[this] { processor.command=processor.learning.load()?2:1; };
+        resetButton.onClick=[this] {
+            processor.hasMatch=false; processor.matchDb=0; processor.learning=false;
+            processor.progress=0; processor.learnResult=0; processor.command=3; processor.matchRevision.fetch_add(1); refreshMatch();
+        };
+        enableButton.setClickingTogglesState(true); abButton.setClickingTogglesState(true);
+        enableAttachment=std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(processor.state,"matchEnabled",enableButton);
+        abAttachment=std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(processor.state,"original",abButton);
+        addAndMakeVisible(readout); readout.setJustificationType(juce::Justification::centred);
+        readout.setColour(juce::Label::textColourId,style::gold);
+        readout.setFont(juce::FontOptions(26.f).withStyle("Bold"));
+        addAndMakeVisible(matchStatus); matchStatus.setColour(juce::Label::textColourId,style::cream);
+        matchStatus.setFont(juce::FontOptions(11.f)); matchStatus.setJustificationType(juce::Justification::centred);
+        resetButton.setTooltip("Clear only the learned adjustment. Compress, Output, Mix and A/B remain unchanged.");
+        enableButton.setTooltip("Enable or disable the learned gain without losing it.");
+        abButton.setTooltip("Compare the original input with the processed output. Short fades prevent switching clicks.");
+        refreshMatch();
+        setSize(840,810);
         startTimerHz(30);
     }
     ~ButterEditor() override { stopTimer(); setLookAndFeel(nullptr); }
@@ -207,6 +328,9 @@ public:
         knobs[0].setBounds(80,402,230,207);
         knobs[1].setBounds(365,423,160,174);
         knobs[2].setBounds(594,423,160,174);
+        learnButton.setBounds(44,652,148,34); resetButton.setBounds(204,652,126,34);
+        enableButton.setBounds(44,698,148,32); abButton.setBounds(204,698,126,32);
+        readout.setBounds(353,645,432,46); matchStatus.setBounds(345,694,448,48);
     }
     void paint(juce::Graphics& g) override {
         using namespace style;
@@ -215,11 +339,11 @@ public:
         g.drawText("YODO AUDIO    /    AIRWINDOWS DSP",32,20,600,20,juce::Justification::left);
         g.setFont(juce::FontOptions(39.f)); g.drawText("ButterComp",30,45,450,54,juce::Justification::left);
         g.setFont(juce::FontOptions(13.f)); g.drawText("S T U D I O",635,65,170,24,juce::Justification::right);
-        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff343d36),0,115,juce::Colour(0xff1e2722),0,625,false));
-        g.fillRoundedRectangle(16,114,808,511,16);
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff343d36),0,115,juce::Colour(0xff1e2722),0,775,false));
+        g.fillRoundedRectangle(16,114,808,661,16);
         // Hairline trim and recessed screws give the panel a hardware finish.
-        g.setColour(gold.withAlpha(.2f)); g.drawRoundedRectangle(juce::Rectangle<float>(17,115,806,509),15,1);
-        for(float x:{30.f,810.f}) for(float y:{128.f,611.f}) {
+        g.setColour(gold.withAlpha(.2f)); g.drawRoundedRectangle(juce::Rectangle<float>(17,115,806,659),15,1);
+        for(float x:{30.f,810.f}) for(float y:{128.f,761.f}) {
             g.setColour(juce::Colour(0xff111a15)); g.fillEllipse(x-4,y-4,8,8);
             g.setColour(juce::Colour(0xff646c5b)); g.drawLine(x-2,y+1,x+2,y-1,1);
         }
@@ -231,12 +355,37 @@ public:
         g.drawText("OUTPUT",365,412,160,24,juce::Justification::centred);
         g.drawText("MIX",594,412,160,24,juce::Justification::centred);
         g.setColour(cream.withAlpha(.1f)); g.drawVerticalLine(330,417,595);
+        g.setColour(cream.withAlpha(.12f)); g.drawHorizontalLine(626,44,796);
+        g.setColour(gold); g.setFont(juce::FontOptions(10.f));
+        g.drawText("LUFS LEVEL MATCH",44,605,752,20,juce::Justification::centred);
         g.setColour(ink.withAlpha(.65f)); g.setFont(juce::FontOptions(11.f));
-        g.drawText("ButterComp2 by Chris Johnson  /  Independent studio edition",32,631,700,22,juce::Justification::left);
-        g.drawText("02",745,631,60,22,juce::Justification::right);
+        g.drawText("ButterComp2 by Chris Johnson  /  Independent studio edition",32,781,700,22,juce::Justification::left);
+        g.drawText("02",745,781,60,22,juce::Justification::right);
     }
 private:
+    void refreshMatch() {
+        const bool learned=processor.hasMatch.load(),active=processor.learning.load();
+        const float db=processor.matchDb.load();
+        const auto trim=(db>=0?juce::String("+"):juce::String{})+juce::String(db,1)+" dB";
+        readout.setText(learned?"MATCH  "+trim:"MATCH  -- dB",juce::dontSendNotification);
+        learnButton.setButtonText(active?"Finish Learning":"Learn Match");
+        enableButton.setButtonText(enableButton.getToggleState()?"Match ON":"Match OFF");
+        abButton.setButtonText(abButton.getToggleState()?"A: Original":"B: Processed");
+        juce::String text;
+        if(active) text="Learning: "+juce::String(processor.progress.load(),1)+" / 15 s of audio";
+        else if(processor.learnResult.load()==static_cast<int>(LoudnessMatch::Result::tooShort)) text="Not enough audio. Play at least 3 seconds and retry.";
+        else if(processor.learnResult.load()==static_cast<int>(LoudnessMatch::Result::noOutput)) text="No measurable output. Check Output / Mix and retry.";
+        else if(learned) {
+            text="Input "+juce::String(processor.learnedInput.load(),1)+"  /  Processed "+juce::String(processor.learnedOutput.load(),1)+" LUFS";
+            if(std::abs(processor.learnedInput.load()-processor.learnedOutput.load()-db)>.1f) text+=" | Gain capped at 24 dB";
+            else if(abButton.getToggleState()) text+=" | Listening to original";
+            else if(!enableButton.getToggleState()) text+=" | Compensation disabled";
+            else text+=" | Fixed gain applied";
+        } else text="Play a representative section, then Learn Match.";
+        matchStatus.setText(text,juce::dontSendNotification);
+    }
     void timerCallback() override {
+        refreshMatch();
         const auto sequence=processor.meterSequence.load(std::memory_order_relaxed);
         idleTicks=sequence==lastSequence?juce::jmin(idleTicks+1,16):0;
         lastSequence=sequence;
@@ -248,6 +397,9 @@ private:
         shownR=r>shownR?r:r+decay*(shownR-r);
         leftMeter.setReduction(shownL); rightMeter.setReduction(shownR);
     }
+    juce::TextButton learnButton{"Learn Match"},resetButton{"Reset Match"},enableButton{"Match ON"},abButton{"B: Processed"};
+    juce::Label readout,matchStatus;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enableAttachment,abAttachment;
     ReductionMeter leftMeter{"LEFT"}, rightMeter{"RIGHT"};
     float shownL=0,shownR=0;
     uint32_t lastSequence=0;
