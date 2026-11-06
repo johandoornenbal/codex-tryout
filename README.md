@@ -25,38 +25,54 @@ Readings above 30 dB pin the needles at the end of the scale. The original DSP i
 output can exceed 0 dBFS. No extra attack, release or threshold controls are invented.
 This plugin has its own identity and does not replace existing Airwindows instances.
 
-## Build on your Mac
+## Build, sign, and install on your Mac
 
-Install Xcode Command Line Tools (`xcode-select --install`) and CMake 3.22 or newer
-(for example `brew install cmake`). From the repository root:
-
-```sh
-cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
-cmake --build build-mac --config Release --parallel 3
-ctest --test-dir build-mac -C Release --output-on-failure
-```
-
-The first configure downloads the pinned JUCE source. An existing JUCE 8.0.12
-checkout can be supplied with `-DJUCE_PATH=/absolute/path/to/JUCE`.
-
-The output is `build-mac/ButterCompStudio_artefacts/Release/VST3/ButterComp Studio.vst3`.
-To install locally:
+Install Xcode Command Line Tools (`xcode-select --install`) and CMake 3.22+
+(`brew install cmake`), close your DAW, then run from the repository:
 
 ```sh
-codesign --force --deep --sign - "build-mac/ButterCompStudio_artefacts/Release/VST3/ButterComp Studio.vst3"
-mkdir -p "$HOME/Library/Audio/Plug-Ins/VST3"
-ditto "build-mac/ButterCompStudio_artefacts/Release/VST3/ButterComp Studio.vst3" \
-  "$HOME/Library/Audio/Plug-Ins/VST3/ButterComp Studio.vst3"
+bash scripts/build-sign-install-mac.sh
 ```
 
-Restart or rescan plugins in your VST3-compatible DAW. Logic Pro requires Audio Unit
-and cannot load this VST3 target. Ad-hoc signing is for local use; distributing a
-trusted macOS release requires Developer ID signing and notarization.
+This one command builds and tests the Apple Silicon VST3, ad-hoc signs a staged
+copy, verifies its signature, and installs it to:
 
-The GitHub Actions workflow builds, tests, ad-hoc signs and archives an arm64 VST3
-on macOS. Once the code is pushed to GitHub, its downloadable artifact appears in
-that workflow run. The workflow has not been run merely by creating this file.
+`~/Library/Audio/Plug-Ins/VST3/ButterComp Studio.vst3`
+
+An existing installation is replaced only after the new copy passes signing and
+verification. If replacement fails, the script attempts to restore the previous
+installation. The source bundle is left unchanged. Restart or rescan plugins in
+your VST3 DAW afterwards.
+
+To sign and install an already downloaded/extracted bundle without compiling:
+
+```sh
+bash scripts/build-sign-install-mac.sh --install-only "/path/to/ButterComp Studio.vst3"
+```
+
+The script targets arm64 (including M2 and later) and macOS 11+, uses no `sudo`,
+and follows the workflow from [GuitarSim](https://github.com/johandoornenbal/guitarsim).
+Run it in a native Apple Silicon terminal with Rosetta disabled. The bundle is
+ad-hoc signed, not notarized. Logic Pro requires an Audio Unit and cannot load
+this VST3 target.
+
+Optional `BUTTERCOMP_BUILD_DIR` and `BUTTERCOMP_INSTALL_DIR` environment variables
+override the build and installation folders. Extra CMake configure arguments are
+passed through, for example:
+
+```sh
+bash scripts/build-sign-install-mac.sh -DJUCE_PATH=/absolute/path/to/JUCE
+```
+
+The first configure downloads pinned JUCE 8.0.12 unless an existing checkout is
+provided. The default build output is:
+
+`build-mac/ButterCompStudio_artefacts/Release/VST3/ButterComp Studio.vst3`
+
+For command-line options, run `bash scripts/build-sign-install-mac.sh --help`.
+GitHub Actions also builds, tests, ad-hoc signs, and archives the arm64 VST3.
+Actual macOS compilation, signing, and DAW playback require verification on a Mac;
+Linux script checks do not establish that those steps work.
 
 ## Validation
 
